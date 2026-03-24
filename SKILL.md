@@ -39,7 +39,7 @@ python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
 
 python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
   --pack /path/to/douyin-pack.md \
-  --full
+  --step full
 ```
 
 或直接传参数：
@@ -53,7 +53,7 @@ python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
   --horizontal-cover /path/to/cover_4x3.png \
   --music "热门" \
   --visibility private \
-  --full
+  --step full
 ```
 
 ## 核心参数
@@ -129,19 +129,21 @@ python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
 
 ### 标准工作流（wemedia 流水线 Step 7.5）
 1. main 校验：晨星已确认、视频和双封面已就绪
-2. 打开上传页面
-3. 上传视频文件
-4. 填写标题 / 描述 / 话题
-5. 上传双封面
-6. 选择背景音乐（可选，找不到入口则跳过）
-7. 提交发布
-8. 等待审核结果（通常 10-30 分钟）
-9. 自动跳转作品管理页核验标题/私密状态/审核中状态
-10. 将结果回报给晨星和监控链路
+2. 先做同标题去重检查（已有同标题则阻断）
+3. 打开上传页面
+4. 上传视频文件（若已在草稿发布页则自动跳过）
+5. 填写标题 / 描述 / 话题
+6. 上传双封面
+7. 选择背景音乐（可选，找不到入口则跳过）
+8. 提交发布
+9. 等待审核结果（通常 10-30 分钟）
+10. 自动跳转作品管理页核验标题/私密状态/审核中状态
+11. 将结果回报给晨星和监控链路
 
 ### 分步执行
 ```bash
 python3 scripts/publish_douyin.py --pack /path/to/douyin-pack.md --step validate_pack
+python3 scripts/publish_douyin.py --step check_duplicate --title "标题"
 python3 scripts/publish_douyin.py --step open_page
 python3 scripts/publish_douyin.py --step upload_video --video /path/video.mp4
 python3 scripts/publish_douyin.py --step fill_meta --title "标题" --description "描述 #AI"

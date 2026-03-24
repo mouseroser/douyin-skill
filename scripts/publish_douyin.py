@@ -6,21 +6,22 @@
 1. 读取 Douyin Publish Pack（--pack）
 2. 支持可见性参数（--visibility private|public）
 3. 支持仅校验发布包（--step validate_pack）
+4. 支持发布前同标题去重检查（--step check_duplicate）
+5. 支持发布后作品管理页核验（--step verify_publish）
 
 用法：
     python3 publish_douyin.py --pack /path/to/douyin-pack.md --step validate_pack
 
-    python3 publish_douyin.py --full \
-        --pack /path/to/douyin-pack.md
+    python3 publish_douyin.py --pack /path/to/douyin-pack.md --step full
 
-    python3 publish_douyin.py --full \
-        --video /path/to/video.mp4 \
+    python3 publish_douyin.py --video /path/to/video.mp4 \
         --title "标题" \
         --description "描述 #AI" \
         --vertical-cover /path/to/v.jpg \
         --horizontal-cover /path/to/h.jpg \
         --music "热门" \
-        --visibility private
+        --visibility private \
+        --step full
 """
 
 import argparse
@@ -940,6 +941,30 @@ def step_wait_review(state: dict, timeout_min: int = 30) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Step: check_duplicate
+# ---------------------------------------------------------------------------
+def step_check_duplicate(state: dict, title: str) -> dict:
+    print("  检查作品管理页是否已有同标题作品...")
+    nav = cdp_navigate(MANAGE_URL, timeout=20)
+    if not nav.get("ok"):
+        return {"ok": False, "error": "跳转作品管理页失败", "raw": nav}
+
+    time.sleep(5)
+    body = cdp_value(cdp_evaluate("document.body.innerText.slice(0,6000)"), "") or ""
+    count = body.count(title) if title else 0
+    duplicate = count > 0
+    state["duplicate_check_url"] = cdp_value(cdp_evaluate("location.href"), MANAGE_URL)
+    state["duplicate_check_count"] = count
+    return {
+        "ok": True,
+        "title": title,
+        "duplicate": duplicate,
+        "count": count,
+        "url": state["duplicate_check_url"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Step: verify_publish
 # ---------------------------------------------------------------------------
 def step_verify_publish(state: dict, title: str, visibility: str = DEFAULT_VISIBILITY) -> dict:
@@ -1002,6 +1027,22 @@ def run_full(state: dict, args) -> dict:
     print(json.dumps(validation, ensure_ascii=False, indent=2))
     results.append("validated")
 
+    print("\n=== 0.5 同标题去重检查 ===")
+    dup = step_check_duplicate(state, args.title)
+    print(json.dumps(dup, ensure_ascii=False, indent=2))
+    if not dup.get("ok"):
+        return {"ok": False, "error": "去重检查失败", "step": 0.5, "duplicate": dup}
+    if dup.get("duplicate"):
+        return {
+            "ok": False,
+            "error": f"检测到同标题作品已存在: {args.title}",
+            "step": 0.5,
+            "duplicate": dup,
+            "title": args.title,
+            "content_id": getattr(args, "content_id", None),
+        }
+    results.append("duplicate_check_passed")
+
     print("\n=== 1. 打开上传页面 ===")
     r = step_open_page(state)
     if not r.get("ok"):
@@ -1059,11 +1100,24 @@ def run_full(state: dict, args) -> dict:
     else:
         results.append("verify_manage_failed")
 
+    structured = {
+        "content_id": getattr(args, "content_id", None),
+        "title": args.title,
+        "visibility": args.visibility,
+        "manage_url": verify.get("url"),
+        "title_found": verify.get("title_found"),
+        "private_marker": verify.get("private_marker"),
+        "review_state": r.get("status"),
+        "reviewing": verify.get("reviewing"),
+        "published_marker": verify.get("published_marker"),
+    }
+
     return {
         "ok": bool(r.get("ok") and verify.get("ok")),
         "steps": results,
         "review": r,
         "verify": verify,
+        "result": structured,
         "video": args.video,
         "title": args.title,
         "visibility": args.visibility,
@@ -1077,7 +1131,7 @@ def run_full(state: dict, args) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="抖音 CDP 自动化发布")
     parser.add_argument("--step", choices=[
-        "validate_pack", "open_page", "upload_video", "fill_meta",
+        "validate_pack", "check_duplicate", "open_page", "upload_video", "fill_meta",
         "select_covers", "select_music", "set_visibility",
         "submit", "wait_review", "verify_publish", "full"
     ], default="full")
@@ -1111,6 +1165,7 @@ def main():
         result = run_full(state, args)
     else:
         step_funcs = {
+            "check_duplicate": lambda: step_check_duplicate(state, args.title or ""),
             "open_page": lambda: step_open_page(state),
             "upload_video": lambda: step_upload_video(state, args.video),
             "fill_meta": lambda: step_fill_meta(state, args.title or "", args.description or ""),
