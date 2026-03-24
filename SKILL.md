@@ -33,14 +33,27 @@ main 回报审核结果
 ## 快速开始
 
 ```bash
-python3 ~/.openclaw/skills/douyin/scripts/publish_douyin.py \
+python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
+  --pack /path/to/douyin-pack.md \
+  --step validate_pack
+
+python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
+  --pack /path/to/douyin-pack.md \
+  --full
+```
+
+或直接传参数：
+
+```bash
+python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
   --video /path/to/video.mp4 \
   --title "视频标题" \
   --description "视频描述，带#话题标签" \
   --vertical-cover /path/to/cover_9x16.png \
   --horizontal-cover /path/to/cover_4x3.png \
   --music "热门" \
-  --topics "科技" "数码" "AI"
+  --visibility private \
+  --full
 ```
 
 ## 核心参数
@@ -52,7 +65,9 @@ python3 ~/.openclaw/skills/douyin/scripts/publish_douyin.py \
 | `--description` | ✅ | `description` | 视频描述，正文末尾带 `#标签名` |
 | `--vertical-cover` | ✅ | `vertical_cover_path` | 竖版封面（9:16，2160×3840 或等比） |
 | `--horizontal-cover` | ✅ | `horizontal_cover_path` | 横版封面（4:3，1600×1200 或等比） |
+| `--pack` | ❌ | 整个发布包 | Douyin Publish Pack 路径（md/json） |
 | `--music` | ❌ | `music` | 背景音乐关键词，默认 `热门` |
+| `--visibility` | ❌ | `visibility` | 可见性：`private` / `public`，默认 `private` |
 | `--topics` | ❌ | 从 `description` 提取 | 话题标签列表；通常可直接从 description 提取 |
 | `--review-timeout` | ❌ | - | 审核等待超时，默认 30 分钟 |
 
@@ -125,11 +140,13 @@ python3 ~/.openclaw/skills/douyin/scripts/publish_douyin.py \
 
 ### 分步执行
 ```bash
+python3 scripts/publish_douyin.py --pack /path/to/douyin-pack.md --step validate_pack
 python3 scripts/publish_douyin.py --step open_page
 python3 scripts/publish_douyin.py --step upload_video --video /path/video.mp4
 python3 scripts/publish_douyin.py --step fill_meta --title "标题" --description "描述 #AI"
 python3 scripts/publish_douyin.py --step select_covers --vertical-cover /path/v.png --horizontal-cover /path/h.png
 python3 scripts/publish_douyin.py --step select_music --music "热门"
+python3 scripts/publish_douyin.py --step set_visibility --visibility private
 python3 scripts/publish_douyin.py --step submit
 python3 scripts/publish_douyin.py --step wait_review --review-timeout 30
 ```
