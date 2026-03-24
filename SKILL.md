@@ -129,7 +129,7 @@ python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
 
 ### 标准工作流（wemedia 流水线 Step 7.5）
 1. main 校验：晨星已确认、视频和双封面已就绪
-2. 先做同标题去重检查（已有同标题则阻断）
+2. 先做发布前去重检查（远端同标题 + 本地账本 content_id/video_path/title 任一命中则阻断）
 3. 打开上传页面
 4. 上传视频文件（若已在草稿发布页则自动跳过）
 5. 填写标题 / 描述 / 话题
@@ -143,7 +143,7 @@ python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
 ### 分步执行
 ```bash
 python3 scripts/publish_douyin.py --pack /path/to/douyin-pack.md --step validate_pack
-python3 scripts/publish_douyin.py --step check_duplicate --title "标题"
+python3 scripts/publish_douyin.py --step check_duplicate --title "标题" --video /path/video.mp4
 python3 scripts/publish_douyin.py --step open_page
 python3 scripts/publish_douyin.py --step upload_video --video /path/video.mp4
 python3 scripts/publish_douyin.py --step fill_meta --title "标题" --description "描述 #AI"

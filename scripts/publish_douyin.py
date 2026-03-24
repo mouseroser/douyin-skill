@@ -43,6 +43,7 @@ MANAGE_URL = "https://creator.douyin.com/creator-micro/content/manage?enter_from
 DEFAULT_MUSIC = "热门"
 DEFAULT_VISIBILITY = "private"
 STATE_FILE = "/tmp/douyin_publish_state.json"
+LEDGER_FILE = "/Users/lucifinil_chen/.openclaw/workspace/intel/collaboration/media/wemedia/douyin/publish-ledger.json"
 
 PACK_FIELD_LABELS = {
     "platform": ["平台", "platform"],
@@ -88,6 +89,31 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+
+def load_ledger():
+    p = Path(LEDGER_FILE)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding='utf-8'))
+        except Exception:
+            return []
+    return []
+
+
+
+def save_ledger(entries):
+    p = Path(LEDGER_FILE)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+
+def append_ledger_entry(entry: dict):
+    entries = load_ledger()
+    entries.append(entry)
+    save_ledger(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -943,7 +969,7 @@ def step_wait_review(state: dict, timeout_min: int = 30) -> dict:
 # ---------------------------------------------------------------------------
 # Step: check_duplicate
 # ---------------------------------------------------------------------------
-def step_check_duplicate(state: dict, title: str) -> dict:
+def step_check_duplicate(state: dict, title: str, content_id: Optional[str] = None, video_path: Optional[str] = None) -> dict:
     print("  检查作品管理页是否已有同标题作品...")
     nav = cdp_navigate(MANAGE_URL, timeout=20)
     if not nav.get("ok"):
@@ -951,15 +977,44 @@ def step_check_duplicate(state: dict, title: str) -> dict:
 
     time.sleep(5)
     body = cdp_value(cdp_evaluate("document.body.innerText.slice(0,6000)"), "") or ""
-    count = body.count(title) if title else 0
-    duplicate = count > 0
+    remote_title_count = body.count(title) if title else 0
+    remote_duplicate = remote_title_count > 0
+
+    ledger = load_ledger()
+    normalized_video = str(Path(video_path).resolve()) if video_path else None
+    local_matches = []
+    for item in ledger:
+        reasons = []
+        if title and item.get('title') == title:
+            reasons.append('title')
+        if content_id and item.get('content_id') == content_id:
+            reasons.append('content_id')
+        item_video = item.get('video_path')
+        if normalized_video and item_video and item_video == normalized_video:
+            reasons.append('video_path')
+        if reasons:
+            local_matches.append({
+                'entry': item,
+                'reasons': reasons,
+            })
+
+    local_duplicate = len(local_matches) > 0
+    duplicate = remote_duplicate or local_duplicate
+
     state["duplicate_check_url"] = cdp_value(cdp_evaluate("location.href"), MANAGE_URL)
-    state["duplicate_check_count"] = count
+    state["duplicate_check_count"] = remote_title_count
+    state["duplicate_local_match_count"] = len(local_matches)
     return {
         "ok": True,
         "title": title,
+        "content_id": content_id,
+        "video_path": normalized_video,
         "duplicate": duplicate,
-        "count": count,
+        "remote_title_count": remote_title_count,
+        "remote_duplicate": remote_duplicate,
+        "local_duplicate": local_duplicate,
+        "local_match_count": len(local_matches),
+        "local_matches": local_matches[:5],
         "url": state["duplicate_check_url"],
     }
 
@@ -996,6 +1051,24 @@ def step_verify_publish(state: dict, title: str, visibility: str = DEFAULT_VISIB
     }
 
 
+
+def build_ledger_entry(args, review: dict, verify: dict) -> dict:
+    video_norm = str(Path(args.video).resolve()) if args.video else None
+    return {
+        "content_id": getattr(args, "content_id", None),
+        "title": args.title,
+        "video_path": video_norm,
+        "visibility": args.visibility,
+        "manage_url": verify.get("url"),
+        "review_state": review.get("status"),
+        "reviewing": verify.get("reviewing"),
+        "title_found": verify.get("title_found"),
+        "private_marker": verify.get("private_marker"),
+        "published_marker": verify.get("published_marker"),
+        "recorded_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Step: validate_pack
 # ---------------------------------------------------------------------------
@@ -1028,7 +1101,7 @@ def run_full(state: dict, args) -> dict:
     results.append("validated")
 
     print("\n=== 0.5 同标题去重检查 ===")
-    dup = step_check_duplicate(state, args.title)
+    dup = step_check_duplicate(state, args.title, getattr(args, 'content_id', None), args.video)
     print(json.dumps(dup, ensure_ascii=False, indent=2))
     if not dup.get("ok"):
         return {"ok": False, "error": "去重检查失败", "step": 0.5, "duplicate": dup}
@@ -1112,6 +1185,10 @@ def run_full(state: dict, args) -> dict:
         "published_marker": verify.get("published_marker"),
     }
 
+    if verify.get("ok"):
+        append_ledger_entry(build_ledger_entry(args, r, verify))
+        results.append("ledger_recorded")
+
     return {
         "ok": bool(r.get("ok") and verify.get("ok")),
         "steps": results,
@@ -1165,7 +1242,7 @@ def main():
         result = run_full(state, args)
     else:
         step_funcs = {
-            "check_duplicate": lambda: step_check_duplicate(state, args.title or ""),
+            "check_duplicate": lambda: step_check_duplicate(state, args.title or "", getattr(args, 'content_id', None), args.video),
             "open_page": lambda: step_open_page(state),
             "upload_video": lambda: step_upload_video(state, args.video),
             "fill_meta": lambda: step_fill_meta(state, args.title or "", args.description or ""),
