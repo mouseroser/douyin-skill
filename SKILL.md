@@ -180,7 +180,7 @@ python3 scripts/publish_douyin.py --step wait_review --review-timeout 30
 
 - 页面 / 登录 / CDP 异常：立即返回失败，不伪装成功
 - 发布包缺字段：停止执行，回到 wemedia Step 6 补齐
-- 封面缺失：停止执行，回到 Step 6 补齐
+- 封面缺失：优先使用 **CDP `DOM.setFileInputFiles`** 对封面弹层中的 hidden image input 直写文件；若仍失败，再回到 Step 6 补齐
 - 审核拒绝：回传给 main，由 main 决定退回 Step 6 或 Step 4
 - 审核超时：通知 main 标记 `review_timeout`，建议人工复核后台
 
