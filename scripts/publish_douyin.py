@@ -27,6 +27,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -62,6 +64,8 @@ MULTILINE_FIELDS = {"description", "notes"}
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from cdp_client import cdp_evaluate, cdp_navigate, cdp_screenshot, cdp_upload_file
+    import websocket
+    import urllib.request
     CDP_OK = True
 except ImportError as e:
     CDP_OK = False
@@ -87,6 +91,10 @@ def save_state(state):
 # ---------------------------------------------------------------------------
 # 基础工具
 # ---------------------------------------------------------------------------
+BROWSER_TIMEOUT_MS = 60000
+DOUYIN_TARGET_HINT = "creator.douyin.com"
+
+
 def cdp_value(resp, default=None):
     if not isinstance(resp, dict) or not resp.get("ok"):
         return default
@@ -99,6 +107,243 @@ def cdp_value(resp, default=None):
 
 def js_string(text: str) -> str:
     return json.dumps(text or "", ensure_ascii=False)
+
+
+
+def run_browser_cmd(*args, timeout: int = 90, check: bool = True) -> subprocess.CompletedProcess:
+    cmd = ["openclaw", "browser", "--timeout", str(BROWSER_TIMEOUT_MS), *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if check and proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "browser command failed").strip())
+    return proc
+
+
+
+def get_douyin_target_id() -> Optional[str]:
+    proc = run_browser_cmd("tabs", check=False, timeout=30)
+    text = (proc.stdout or "") + (proc.stderr or "")
+    blocks = [b.strip() for b in re.split(r"\n(?=\d+\.)", text) if b.strip()]
+    for block in blocks:
+        if DOUYIN_TARGET_HINT in block:
+            m = re.search(r"id:\s*([A-F0-9]+)", block)
+            if m:
+                return m.group(1)
+    return None
+
+
+
+def browser_snapshot_text(limit: int = 400) -> str:
+    target_id = get_douyin_target_id()
+    args = ["snapshot", "--limit", str(limit)]
+    if target_id:
+        args += ["--target-id", target_id]
+    proc = run_browser_cmd(*args, check=False, timeout=45)
+    return ((proc.stdout or "") + (proc.stderr or "")).strip()
+
+
+
+def browser_find_ref(patterns) -> Optional[str]:
+    text = browser_snapshot_text(limit=800)
+    for line in text.splitlines():
+        for pattern in patterns:
+            if pattern in line:
+                m = re.search(r"\[ref=(e\d+)\]", line)
+                if m:
+                    return m.group(1)
+    return None
+
+
+
+def browser_click_ref(ref: str) -> str:
+    target_id = get_douyin_target_id()
+    args = ["click", ref]
+    if target_id:
+        args += ["--target-id", target_id]
+    proc = run_browser_cmd(*args, timeout=45)
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+
+def browser_type_ref(ref: str, text: str, submit: bool = False) -> str:
+    target_id = get_douyin_target_id()
+    args = ["type", ref, text]
+    if submit:
+        args.append("--submit")
+    if target_id:
+        args += ["--target-id", target_id]
+    proc = run_browser_cmd(*args, timeout=45)
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+
+def prepare_upload_path(path: str) -> str:
+    src = Path(path).expanduser().resolve()
+    upload_dir = Path('/tmp/openclaw/uploads')
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    dst = upload_dir / src.name
+    if src != dst:
+        shutil.copy2(src, dst)
+    return str(dst)
+
+
+
+def browser_upload_and_click(path: str, ref: str) -> str:
+    target_id = get_douyin_target_id()
+    upload_path = prepare_upload_path(path)
+    args = ["upload", upload_path, "--ref", ref, "--timeout-ms", "120000"]
+    if target_id:
+        args += ["--target-id", target_id]
+    proc = run_browser_cmd(*args, timeout=150)
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+
+def browser_wait_text(text: str, gone: bool = False, timeout_ms: int = 30000) -> str:
+    target_id = get_douyin_target_id()
+    args = ["wait", "--timeout-ms", str(timeout_ms)]
+    args += ["--text-gone" if gone else "--text", text]
+    if target_id:
+        args += ["--target-id", target_id]
+    proc = run_browser_cmd(*args, timeout=max(30, int(timeout_ms / 1000) + 10))
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+
+def browser_wait_url(pattern: str, timeout_ms: int = 30000) -> str:
+    target_id = get_douyin_target_id()
+    args = ["wait", "--url", pattern, "--timeout-ms", str(timeout_ms)]
+    if target_id:
+        args += ["--target-id", target_id]
+    proc = run_browser_cmd(*args, timeout=max(30, int(timeout_ms / 1000) + 10))
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+
+def browser_press(key: str) -> str:
+    target_id = get_douyin_target_id()
+    args = ["press", key]
+    if target_id:
+        args += ["--target-id", target_id]
+    proc = run_browser_cmd(*args, timeout=30)
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+
+def get_target_ws_url() -> str:
+    target_id = get_douyin_target_id()
+    with urllib.request.urlopen('http://127.0.0.1:18800/json', timeout=5) as resp:
+        targets = json.loads(resp.read())
+    if target_id:
+        for t in targets:
+            if t.get('id') == target_id:
+                return t['webSocketDebuggerUrl']
+    for t in targets:
+        if DOUYIN_TARGET_HINT in (t.get('url') or ''):
+            return t['webSocketDebuggerUrl']
+    if targets:
+        return targets[0]['webSocketDebuggerUrl']
+    raise RuntimeError('未找到 CDP target')
+
+
+
+def cdp_raw_call(ws, method: str, params: dict = None, msg_id: int = 1) -> dict:
+    payload = {'id': msg_id, 'method': method}
+    if params:
+        payload['params'] = params
+    ws.send(json.dumps(payload))
+    while True:
+        data = json.loads(ws.recv())
+        if data.get('id') == msg_id:
+            return data
+
+
+
+def cdp_set_file_input_files(file_path: str, picker_mode: str = 'vertical') -> dict:
+    upload_path = prepare_upload_path(file_path)
+    ws = websocket.create_connection(get_target_ws_url(), timeout=20)
+    try:
+        cdp_raw_call(ws, 'Runtime.enable', msg_id=1)
+        cdp_raw_call(ws, 'DOM.enable', msg_id=2)
+
+        if not cdp_value(cdp_evaluate("document.body.innerText.includes('上传封面')"), False):
+            open_expr = r'''(() => {
+              const labels = Array.from(document.querySelectorAll('*')).filter(el => (el.innerText || '').trim() === '选择封面');
+              if (!labels.length) return 'no_select_cover';
+              const el = labels[0];
+              const candidates = [el, el.parentElement, el.parentElement && el.parentElement.parentElement, el.closest('div')];
+              for (const c of candidates) {
+                if (c && c.click) { c.click(); return 'clicked_select_cover'; }
+              }
+              return 'select_cover_not_clickable';
+            })()'''
+            cdp_evaluate(open_expr, timeout=10)
+            time.sleep(2)
+
+        if picker_mode == 'horizontal':
+            switch_expr = r'''(() => {
+              const nodes = Array.from(document.querySelectorAll('*')).filter(el => (el.innerText || '').trim() === '设置横封面');
+              if (!nodes.length) return 'no_switch_horizontal';
+              const el = nodes[0];
+              const candidates = [el, el.parentElement, el.parentElement && el.parentElement.parentElement, el.closest('div')];
+              for (const c of candidates) {
+                if (c && c.click) { c.click(); return 'clicked_switch_horizontal'; }
+              }
+              return 'switch_not_clickable';
+            })()'''
+            cdp_evaluate(switch_expr, timeout=10)
+            time.sleep(2)
+
+        select_expr = r'''(() => {
+          const inputs = Array.from(document.querySelectorAll('input[type=file]')).filter(inp => {
+            const accept = inp.accept || '';
+            const parent = inp.parentElement;
+            const grand = parent && parent.parentElement;
+            const text = ((grand && grand.innerText) || (parent && parent.innerText) || '');
+            return accept.includes('image') && text.includes('点击上传文件或拖拽文件到这里');
+          });
+          return inputs[0] || null;
+        })()'''
+        res = cdp_raw_call(ws, 'Runtime.evaluate', {
+            'expression': select_expr,
+            'returnByValue': False,
+            'awaitPromise': True,
+        }, msg_id=3)
+        obj = res.get('result', {}).get('result', {})
+        object_id = obj.get('objectId')
+        if not object_id:
+            return {'ok': False, 'error': '未找到封面 file input objectId', 'raw': res}
+
+        set_res = cdp_raw_call(ws, 'DOM.setFileInputFiles', {
+            'files': [upload_path],
+            'objectId': object_id,
+        }, msg_id=4)
+        if 'error' in set_res:
+            return {'ok': False, 'error': set_res['error']}
+
+        time.sleep(2)
+        return {'ok': True, 'path': upload_path, 'mode': picker_mode}
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+
+def cdp_complete_cover_dialog() -> dict:
+    expr = r'''(() => {
+      const nodes = Array.from(document.querySelectorAll('button,*')).filter(el => (el.innerText || '').trim() === '完成');
+      if (!nodes.length) return 'no_complete';
+      const el = nodes[0];
+      const candidates = [el, el.parentElement, el.closest('div')];
+      for (const c of candidates) {
+        if (c && c.click) { c.click(); return 'clicked_complete'; }
+      }
+      return 'complete_not_clickable';
+    })()'''
+    raw = cdp_value(cdp_evaluate(expr, timeout=10), '')
+    time.sleep(2)
+    return {'ok': raw in ('clicked_complete',), 'raw': raw}
 
 
 
@@ -277,14 +522,43 @@ def validate_publish_inputs(args, require_files: bool = True) -> dict:
 def step_open_page(state: dict) -> dict:
     print(f"  打开: {CREATOR_URL}")
     r = cdp_navigate(CREATOR_URL)
-    if r.get("ok"):
-        time.sleep(3)
-        cdp_screenshot("page_opened")
-        title = cdp_value(cdp_evaluate("document.title"), "")
-        if title:
-            print(f"  页面标题: {title}")
-        state["page"] = CREATOR_URL
-    return r
+    if not r.get("ok"):
+        return r
+
+    time.sleep(4)
+    title = cdp_value(cdp_evaluate("document.title"), "")
+    if title:
+        print(f"  页面标题: {title}")
+
+    body = cdp_value(cdp_evaluate("document.body.innerText.slice(0,1500)"), "") or ""
+    if "继续编辑" in body:
+        try:
+            ref = browser_find_ref(["继续编辑"])
+            if ref:
+                print(f"  检测到草稿，点击继续编辑: {ref}")
+                print(f"  {browser_click_ref(ref)}")
+            else:
+                print("  snapshot 未拿到继续编辑 ref，改用 CDP 点击")
+                click_result = cdp_value(cdp_evaluate(r'''(() => {
+                    const els = Array.from(document.querySelectorAll('button, [role="button"], div, span'));
+                    for (const el of els) {
+                        const txt = (el.innerText || '').trim();
+                        if (txt === '继续编辑') { el.click(); return 'clicked_continue_edit'; }
+                    }
+                    return 'continue_edit_not_found';
+                })()'''), "")
+                print(f"  {click_result}")
+            time.sleep(5)
+            try:
+                browser_wait_url("**/content/post/video**", timeout_ms=30000)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"  继续编辑失败: {e}")
+
+    cdp_screenshot("page_opened")
+    state["page"] = cdp_value(cdp_evaluate("location.href"), CREATOR_URL)
+    return {"ok": True, "url": state["page"]}
 
 
 # ---------------------------------------------------------------------------
@@ -295,11 +569,31 @@ def step_upload_video(state: dict, video_path: str) -> dict:
         return {"ok": False, "error": f"视频文件不存在: {video_path}"}
 
     print(f"  上传视频: {video_path}")
-    r = cdp_upload_file("video", video_path)
-    print(f"  上传触发: {r}")
-    if r.get("ok"):
+    current_url = cdp_value(cdp_evaluate("location.href"), "") or ""
+    body = cdp_value(cdp_evaluate("document.body.innerText.slice(0,1500)"), "") or ""
+    if (
+        "/content/post/video" in current_url
+        or "设置封面" in body
+        or "重新上传" in body
+        or "预览视频" in body
+    ):
+        print("  当前草稿页已有视频，跳过重新上传")
         state["video"] = video_path
-    return r
+        return {"ok": True, "skipped": True, "reason": "draft_already_loaded", "url": current_url}
+
+    ref = browser_find_ref(["点击上传 或直接将视频文件拖入此区域", "上传视频"])
+    if not ref:
+        return {"ok": False, "error": "未找到视频上传入口 ref"}
+
+    try:
+        output = browser_upload_and_click(video_path, ref)
+        print(f"  上传结果: {output}")
+        browser_wait_url("**/content/post/video**", timeout_ms=90000)
+        time.sleep(5)
+        state["video"] = video_path
+        return {"ok": True, "result": output}
+    except Exception as e:
+        return {"ok": False, "error": f"视频上传失败: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -310,17 +604,30 @@ def step_fill_meta(state: dict, title: str, description: str) -> dict:
     print(f"  标题: {title}")
     print(f"  话题: {hashtags}")
 
+    title_ref = browser_find_ref(["填写作品标题，为作品获得更多流量", 'textbox "填写作品标题'])
+    if title_ref:
+        try:
+            print(f"  标题输入框: {title_ref}")
+            print(f"  {browser_type_ref(title_ref, title)}")
+        except Exception as e:
+            print(f"  browser type 标题失败，回退 CDP: {e}")
+    else:
+        print("  未找到标题 ref，回退 CDP 填写")
+
     title_js = js_string(title)
     desc_js = js_string(description)
-
     script = f"""
     (() => {{
         const setValue = (el, value) => {{
             if (!el) return false;
-            const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-            if (desc && desc.set) desc.set.call(el, value);
-            else el.value = value;
+            if ('value' in el) {{
+                const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) desc.set.call(el, value);
+                else el.value = value;
+            }} else {{
+                el.innerText = value;
+            }}
             el.dispatchEvent(new Event('input', {{ bubbles: true }}));
             el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             return true;
@@ -346,11 +653,12 @@ def step_fill_meta(state: dict, title: str, description: str) -> dict:
             descCandidates[0].focus();
             descDone = setValue(descCandidates[0], {desc_js});
         }} else {{
-            const editable = document.querySelector('[contenteditable="true"]');
-            if (editable) {{
-                editable.focus();
-                editable.innerText = {desc_js};
-                editable.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: {desc_js} }}));
+            const editables = Array.from(document.querySelectorAll('[contenteditable="true"]'));
+            const target = editables.find(el => !((el.innerText || '').includes('预览视频')) ) || editables[0];
+            if (target) {{
+                target.focus();
+                target.innerText = {desc_js};
+                target.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: {desc_js} }}));
                 descDone = true;
             }}
         }}
@@ -364,7 +672,7 @@ def step_fill_meta(state: dict, title: str, description: str) -> dict:
     cdp_screenshot("meta_filled")
     state["title"] = title
     state["description"] = description
-    return {"ok": True, "title": title, "hashtags": hashtags}
+    return {"ok": True, "title": title, "hashtags": hashtags, "raw": raw}
 
 
 # ---------------------------------------------------------------------------
@@ -373,26 +681,38 @@ def step_fill_meta(state: dict, title: str, description: str) -> dict:
 def step_select_covers(state: dict, vertical_cover: str = None, horizontal_cover: str = None) -> dict:
     results = {}
 
+    body = cdp_value(cdp_evaluate("document.body.innerText.slice(0,2600)"), "") or ""
+    if "横/竖双封面缺失" not in body and "设置封面" not in body:
+        print("  页面未显示封面缺失提示，跳过封面步骤")
+        return {"ok": True, "skipped": True, "reason": "no_cover_prompt"}
+
     if vertical_cover and os.path.exists(vertical_cover):
-        print(f"  上传竖版封面: {vertical_cover}")
-        r = cdp_upload_file("image", vertical_cover)
-        print(f"  竖版封面: {r}")
-        results["vertical"] = r
+        print(f"  通过 CDP objectId 直写竖版封面: {vertical_cover}")
+        results['vertical'] = cdp_set_file_input_files(vertical_cover, 'vertical')
+        print(f"  竖版封面结果: {results['vertical']}")
+        time.sleep(2)
     else:
-        print("  竖版封面: 未指定或文件不存在，跳过")
+        results['vertical'] = {"ok": False, "error": "竖版封面不存在"}
 
     if horizontal_cover and os.path.exists(horizontal_cover):
-        print(f"  上传横版封面: {horizontal_cover}")
-        r = cdp_upload_file("image", horizontal_cover)
-        print(f"  横版封面: {r}")
-        results["horizontal"] = r
+        print(f"  通过 CDP objectId 直写横版封面: {horizontal_cover}")
+        results['horizontal'] = cdp_set_file_input_files(horizontal_cover, 'horizontal')
+        print(f"  横版封面结果: {results['horizontal']}")
+        time.sleep(2)
     else:
-        print("  横版封面: 未指定或文件不存在，跳过")
+        results['horizontal'] = {"ok": False, "error": "横版封面不存在"}
 
+    complete = cdp_complete_cover_dialog()
+    print(f"  完成封面设置: {complete}")
+    results['complete'] = complete
+    time.sleep(2)
+
+    body_after = cdp_value(cdp_evaluate("document.body.innerText.slice(0,2800)"), "") or ""
+    missing = "横/竖双封面缺失" in body_after
     cdp_screenshot("covers_selected")
     state["vertical_cover"] = vertical_cover
     state["horizontal_cover"] = horizontal_cover
-    return {"ok": True, "covers": results}
+    return {"ok": not missing, "covers": results, "missing_after": missing}
 
 
 # ---------------------------------------------------------------------------
@@ -529,17 +849,32 @@ def step_set_visibility(state: dict, visibility: str = DEFAULT_VISIBILITY) -> di
 def step_submit(state: dict) -> dict:
     cdp_screenshot("before_submit")
 
+    submit_ref = browser_find_ref(['button "发布"'])
+    if submit_ref:
+        try:
+            print(f"  点击发布 ref: {submit_ref}")
+            output = browser_click_ref(submit_ref)
+            print(f"  发布按钮: {output}")
+            time.sleep(3)
+            cdp_screenshot("after_submit")
+            return {"ok": True, "result": output, "ref": submit_ref}
+        except Exception as e:
+            print(f"  browser click 发布失败，回退 CDP: {e}")
+
     submit_script = """
     (() => {
         const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
         for (const btn of btns) {
             const txt = (btn.innerText || '').trim();
-            if (txt === '发布' || txt.includes('发布') || txt === 'Publish') {
+            if (txt === '发布' || txt === 'Publish') {
                 btn.click();
                 return 'submit_clicked';
             }
         }
-        const publishBtn = document.querySelector('[data-e2e*="publish"], [data-e2e*="submit"]');
+        const publishBtn = Array.from(document.querySelectorAll('[data-e2e*="publish"], [data-e2e*="submit"]')).find(el => {
+            const txt = (el.innerText || '').trim();
+            return txt === '' || txt === '发布' || txt === 'Publish';
+        });
         if (publishBtn) {
             publishBtn.click();
             return 'submit_clicked_datae2e';
@@ -548,7 +883,7 @@ def step_submit(state: dict) -> dict:
     })()
     """
     raw = cdp_value(cdp_evaluate(submit_script), "submit_btn_not_found")
-    print(f"  发布按钮: {raw}")
+    print(f"  发布按钮(CDP): {raw}")
 
     if raw not in ("submit_btn_not_found", None):
         time.sleep(3)
@@ -576,8 +911,8 @@ def step_wait_review(state: dict, timeout_min: int = 30) -> dict:
         (() => {
             const body = document.body.innerText || '';
             if (body.includes('发布成功') || body.includes('发布完成')) return 'passed';
-            if (body.includes('审核失败') || body.includes('未通过') || body.includes('违规')) return 'rejected';
             if (body.includes('审核中') || body.includes('等待审核') || body.includes('审核通过')) return 'reviewing';
+            if (body.includes('审核失败') || body.includes('未通过') || body.includes('违规')) return 'rejected';
             return 'unknown';
         })()
         """
