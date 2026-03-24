@@ -133,10 +133,11 @@ python3 ~/.openclaw/skills/douyin-skill/scripts/publish_douyin.py \
 3. 上传视频文件
 4. 填写标题 / 描述 / 话题
 5. 上传双封面
-6. 选择背景音乐
+6. 选择背景音乐（可选，找不到入口则跳过）
 7. 提交发布
 8. 等待审核结果（通常 10-30 分钟）
-9. 将结果回报给晨星和监控链路
+9. 自动跳转作品管理页核验标题/私密状态/审核中状态
+10. 将结果回报给晨星和监控链路
 
 ### 分步执行
 ```bash
@@ -149,6 +150,7 @@ python3 scripts/publish_douyin.py --step select_music --music "热门"
 python3 scripts/publish_douyin.py --step set_visibility --visibility private
 python3 scripts/publish_douyin.py --step submit
 python3 scripts/publish_douyin.py --step wait_review --review-timeout 30
+python3 scripts/publish_douyin.py --step verify_publish --title "标题" --visibility private
 ```
 
 ## 典型用例

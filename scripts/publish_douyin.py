@@ -38,6 +38,7 @@ from typing import Optional, Tuple
 # 平台常量
 # ---------------------------------------------------------------------------
 CREATOR_URL = "https://creator.douyin.com/creator-micro/content/upload"
+MANAGE_URL = "https://creator.douyin.com/creator-micro/content/manage?enter_from=publish"
 DEFAULT_MUSIC = "热门"
 DEFAULT_VISIBILITY = "private"
 STATE_FILE = "/tmp/douyin_publish_state.json"
@@ -736,6 +737,12 @@ def step_select_music(state: dict, music: str = DEFAULT_MUSIC) -> dict:
     """
     r1 = cdp_value(cdp_evaluate(btn_script), "")
     print(f"  音乐按钮: {r1}")
+
+    if r1 == 'music_btn_not_found':
+        print("  页面未提供可操作的音乐入口，按可选步骤跳过")
+        state["music"] = music
+        return {"ok": True, "skipped": True, "reason": "music_optional_not_found"}
+
     time.sleep(2)
 
     if music and music != DEFAULT_MUSIC:
@@ -779,7 +786,7 @@ def step_select_music(state: dict, music: str = DEFAULT_MUSIC) -> dict:
 
     cdp_screenshot("music_selected")
     state["music"] = music
-    return {"ok": r3 != "music_item_not_found", "result": r3}
+    return {"ok": True, "result": r3, "selected": r3 == 'music_selected'}
 
 
 # ---------------------------------------------------------------------------
@@ -910,9 +917,9 @@ def step_wait_review(state: dict, timeout_min: int = 30) -> dict:
         check_script = """
         (() => {
             const body = document.body.innerText || '';
-            if (body.includes('发布成功') || body.includes('发布完成')) return 'passed';
             if (body.includes('审核中') || body.includes('等待审核') || body.includes('审核通过')) return 'reviewing';
-            if (body.includes('审核失败') || body.includes('未通过') || body.includes('违规')) return 'rejected';
+            if (body.includes('发布成功') || body.includes('发布完成')) return 'passed';
+            if (body.includes('审核失败') || body.includes('违规')) return 'rejected';
             return 'unknown';
         })()
         """
@@ -929,7 +936,39 @@ def step_wait_review(state: dict, timeout_min: int = 30) -> dict:
 
         time.sleep(60)
 
-    return {"ok": False, "status": "review_timeout", "timeout_min": timeout_min}
+    return {"ok": True, "status": "review_pending", "timeout_min": timeout_min}
+
+
+# ---------------------------------------------------------------------------
+# Step: verify_publish
+# ---------------------------------------------------------------------------
+def step_verify_publish(state: dict, title: str, visibility: str = DEFAULT_VISIBILITY) -> dict:
+    print("  跳转作品管理页核验发布结果...")
+    nav = cdp_navigate(MANAGE_URL, timeout=20)
+    if not nav.get("ok"):
+        return {"ok": False, "error": "跳转作品管理页失败", "raw": nav}
+
+    time.sleep(5)
+    snapshot = browser_snapshot_text(limit=500)
+    body = cdp_value(cdp_evaluate("document.body.innerText.slice(0,4000)"), "") or ""
+
+    found_in_snapshot = title in snapshot
+    found_in_body = title in body
+    private_ok = (visibility != "private") or ("私密" in body)
+    reviewing = "审核中" in body
+    published = "已发布" in body and found_in_body
+
+    state["verify_manage_url"] = cdp_value(cdp_evaluate("location.href"), MANAGE_URL)
+    state["verify_found_title"] = found_in_snapshot or found_in_body
+
+    return {
+        "ok": found_in_snapshot or found_in_body,
+        "title_found": found_in_snapshot or found_in_body,
+        "private_marker": private_ok,
+        "reviewing": reviewing,
+        "published_marker": published,
+        "url": state["verify_manage_url"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -973,9 +1012,13 @@ def run_full(state: dict, args) -> dict:
     r = step_upload_video(state, args.video)
     if not r.get("ok"):
         return {"ok": False, "error": "上传视频失败", "step": 2}
-    print("  等待视频上传（30秒）...")
-    time.sleep(30)
-    results.append("video_uploaded")
+    if r.get("skipped"):
+        print(f"  跳过视频上传: {r.get('reason')}")
+        results.append("video_reused_from_draft")
+    else:
+        print("  等待视频上传（30秒）...")
+        time.sleep(30)
+        results.append("video_uploaded")
 
     print("\n=== 3. 填写元信息 ===")
     r = step_fill_meta(state, args.title, args.description)
@@ -1009,10 +1052,18 @@ def run_full(state: dict, args) -> dict:
     r = step_wait_review(state, args.review_timeout)
     results.append(f"review_{r.get('status', 'unknown')}")
 
+    print("\n=== 9. 作品管理页核验 ===")
+    verify = step_verify_publish(state, args.title, args.visibility)
+    if verify.get("ok"):
+        results.append("verify_manage_ok")
+    else:
+        results.append("verify_manage_failed")
+
     return {
-        "ok": True,
+        "ok": bool(r.get("ok") and verify.get("ok")),
         "steps": results,
         "review": r,
+        "verify": verify,
         "video": args.video,
         "title": args.title,
         "visibility": args.visibility,
@@ -1028,7 +1079,7 @@ def main():
     parser.add_argument("--step", choices=[
         "validate_pack", "open_page", "upload_video", "fill_meta",
         "select_covers", "select_music", "set_visibility",
-        "submit", "wait_review", "full"
+        "submit", "wait_review", "verify_publish", "full"
     ], default="full")
     parser.add_argument("--pack", help="Douyin Publish Pack 路径（md/json）")
     parser.add_argument("--video", help="视频文件路径")
@@ -1068,6 +1119,7 @@ def main():
             "set_visibility": lambda: step_set_visibility(state, args.visibility),
             "submit": lambda: step_submit(state),
             "wait_review": lambda: step_wait_review(state, args.review_timeout),
+            "verify_publish": lambda: step_verify_publish(state, args.title or "", args.visibility),
         }
         result = step_funcs[args.step]()
 
